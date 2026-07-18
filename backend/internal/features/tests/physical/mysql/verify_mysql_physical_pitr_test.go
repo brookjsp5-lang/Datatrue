@@ -152,7 +152,7 @@ func TestVerificationScriptSupportsDirectoryBackupMode(t *testing.T) {
 	scriptText := string(script)
 	requiredSnippets := []string{
 		`BACKUP_MODE="${BACKUP_MODE:-stream}"`,
-		`stream|directory|coldcopy) ;;`,
+		`stream|directory|coldcopy|hot-incremental) ;;`,
 		`if [ "$BACKUP_MODE" = "stream" ]; then`,
 		`--stream=xbstream`,
 		`else`,
@@ -192,7 +192,7 @@ func TestVerificationScriptSupportsColdCopyPhysicalBackupMode(t *testing.T) {
 
 	scriptText := string(script)
 	requiredSnippets := []string{
-		`stream|directory|coldcopy) ;;`,
+		`stream|directory|coldcopy|hot-incremental) ;;`,
 		"if [ \"$BACKUP_MODE\" = \"coldcopy\" ]; then\n  TOOL_IMAGE=\"${TOOL_IMAGE:-$XTRABACKUP_IMAGE}\"",
 		`if [ "$BACKUP_MODE" = "coldcopy" ]; then`,
 		`docker stop "$SRC"`,
@@ -204,6 +204,58 @@ func TestVerificationScriptSupportsColdCopyPhysicalBackupMode(t *testing.T) {
 	for _, snippet := range requiredSnippets {
 		if !strings.Contains(scriptText, snippet) {
 			t.Fatalf("verification script should contain %q to support cold-copy physical backup/PITR verification", snippet)
+		}
+	}
+}
+
+func TestVerificationScriptSupportsHotIncrementalBackupMode(t *testing.T) {
+	script, err := os.ReadFile("verify_mysql_physical_pitr.sh")
+	if err != nil {
+		t.Fatalf("failed to read verification script: %v", err)
+	}
+
+	scriptText := string(script)
+	requiredSnippets := []string{
+		`stream|directory|coldcopy|hot-incremental) ;;`,
+		`if [ "$BACKUP_MODE" = "hot-incremental" ]; then`,
+		`--target-dir=/work/full`,
+		`--target-dir=/work/inc1`,
+		`--incremental-basedir=/work/full`,
+		`cat "$BASE/full/xtrabackup_binlog_info"`,
+		`BACKUP_BINLOG_INFO="$BASE/inc1/xtrabackup_binlog_info"`,
+		`xtrabackup --prepare --apply-log-only --target-dir=/work/full`,
+		`xtrabackup --prepare --target-dir=/work/full --incremental-dir=/work/inc1`,
+		`cp -a "$BASE/full/." "$BASE/restore-data/"`,
+		`2:after_full_before_incremental`,
+		`3:before_target`,
+		`VALUES (4, 'after_target', 'must_not_exist')`,
+	}
+	for _, snippet := range requiredSnippets {
+		if !strings.Contains(scriptText, snippet) {
+			t.Fatalf("verification script should contain %q to support hot full plus incremental backup verification", snippet)
+		}
+	}
+}
+
+func TestVerificationScriptStreamsBinlogsInRealtimeForHotIncrementalMode(t *testing.T) {
+	script, err := os.ReadFile("verify_mysql_physical_pitr.sh")
+	if err != nil {
+		t.Fatalf("failed to read verification script: %v", err)
+	}
+
+	scriptText := string(script)
+	requiredSnippets := []string{
+		`BINLOG_STREAM_CONTAINER="${PREFIX}-binlog-stream"`,
+		`docker run -d --name "$BINLOG_STREAM_CONTAINER" --user "$TOOL_USER"`,
+		`mysqlbinlog --read-from-remote-server --raw --stop-never --to-last-log`,
+		`--connection-server-id=1703`,
+		`docker rm -f "$BINLOG_STREAM_CONTAINER"`,
+		`wait_for_binlog_file "$BINLOG_FILE"`,
+		`stop_binlog_stream`,
+	}
+	for _, snippet := range requiredSnippets {
+		if !strings.Contains(scriptText, snippet) {
+			t.Fatalf("verification script should contain %q to stream remote binlogs continuously", snippet)
 		}
 	}
 }

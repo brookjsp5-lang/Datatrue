@@ -36,7 +36,7 @@ func Test_BuildBinlogStreamCommand_IncludesRemoteRawStreamingArguments(t *testin
 		"--user=backup_user",
 		"--result-file=/var/lib/databasus/binlogs/mysql-bin.",
 		"--ssl-mode=REQUIRED",
-		"--server-id=184467",
+		"--connection-server-id=184467",
 		"mysql-bin.000123",
 	}
 	for _, requiredArg := range requiredArgs {

@@ -59,7 +59,7 @@ func BuildBinlogStreamCommand(request BinlogStreamCommandRequest) (CommandPlan, 
 	}
 
 	if request.ServerID > 0 {
-		args = append(args, fmt.Sprintf("--server-id=%d", request.ServerID))
+		args = append(args, fmt.Sprintf("--connection-server-id=%d", request.ServerID))
 	}
 
 	args = append(args, request.StartFile)

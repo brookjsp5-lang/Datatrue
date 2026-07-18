@@ -29,9 +29,9 @@ XTRABACKUP_TAG="${XTRABACKUP_TAG:-$DEFAULT_XTRABACKUP_TAG}"
 XTRABACKUP_IMAGE="${XTRABACKUP_IMAGE:-$IMAGE_PREFIX/percona/percona-xtrabackup:$XTRABACKUP_TAG}"
 
 case "$BACKUP_MODE" in
-  stream|directory|coldcopy) ;;
+  stream|directory|coldcopy|hot-incremental) ;;
   *)
-    echo "Unsupported BACKUP_MODE '$BACKUP_MODE'. Expected stream, directory, or coldcopy." >&2
+    echo "Unsupported BACKUP_MODE '$BACKUP_MODE'. Expected stream, directory, coldcopy, or hot-incremental." >&2
     exit 2
     ;;
 esac
@@ -55,6 +55,7 @@ BASE="$WORK_ROOT/$PREFIX"
 SRC="${PREFIX}-src"
 DST="${PREFIX}-dst"
 NET="${PREFIX}-net"
+BINLOG_STREAM_CONTAINER="${PREFIX}-binlog-stream"
 SRC_HOST="source-mysql"
 DST_HOST="restore-mysql"
 
@@ -64,6 +65,8 @@ log() {
 
 cleanup() {
   set +e
+  stop_binlog_stream >/dev/null 2>&1 || true
+  docker rm -f "$BINLOG_STREAM_CONTAINER" >/dev/null 2>&1 || true
   docker ps -aq --filter "name=${PREFIX}-tool-" | xargs -r docker rm -f >/dev/null 2>&1 || true
   if [ "$KEEP_CONTAINERS" = "1" ]; then
     echo "Keeping verification containers with prefix $PREFIX"
@@ -133,11 +136,50 @@ read_binlog_status() {
   mysql_exec "$container" "SHOW MASTER STATUS;"
 }
 
+start_binlog_stream() {
+  local start_file="$1"
+  log "Starting realtime binlog stream from $start_file"
+  docker rm -f "$BINLOG_STREAM_CONTAINER" >/dev/null 2>&1 || true
+  docker run -d --name "$BINLOG_STREAM_CONTAINER" --user "$TOOL_USER" --network "$NET" "${DOCKER_LIMIT_ARGS[@]}" \
+    -v "$BASE/binlogs:/work/binlogs" \
+    --entrypoint bash "$TOOL_IMAGE" -lc \
+    "mysqlbinlog --read-from-remote-server --raw --stop-never --to-last-log --host=$SRC_CONNECT_HOST --port=3306 --user=root --password='$ROOT_PASSWORD' --result-file=/work/binlogs/ --connection-server-id=1703 $start_file" \
+    >/dev/null
+}
+
+stop_binlog_stream() {
+  set +e
+  if docker ps -aq --filter "name=^/${BINLOG_STREAM_CONTAINER}$" | grep -q .; then
+    docker logs "$BINLOG_STREAM_CONTAINER" > "$BASE/mysqlbinlog-stream.out" 2> "$BASE/mysqlbinlog-stream.log" || true
+    docker stop -t 10 "$BINLOG_STREAM_CONTAINER" >/dev/null 2>&1 || true
+    docker rm -f "$BINLOG_STREAM_CONTAINER" >/dev/null 2>&1 || true
+  fi
+  set -e
+}
+
+wait_for_binlog_file() {
+  local file="$1"
+  for _ in $(seq 1 90); do
+    if [ -s "$BASE/binlogs/$file" ]; then
+      return 0
+    fi
+    sleep 1
+  done
+  echo "timed out waiting for realtime binlog file $file" >&2
+  ls -l "$BASE/binlogs" >&2 || true
+  docker logs "$BINLOG_STREAM_CONTAINER" >&2 || true
+  return 1
+}
+
 rm -rf "$BASE"
 mkdir -p \
   "$BASE/source-data" \
+  "$BASE/full" \
+  "$BASE/inc1" \
   "$BASE/full-tmp" \
   "$BASE/meta" \
+  "$BASE/full-meta" \
+  "$BASE/inc1-meta" \
   "$BASE/binlogs" \
   "$BASE/restore-extract" \
   "$BASE/restore-data"
@@ -189,6 +231,16 @@ mysql_exec "$SRC" "
   FLUSH LOGS;
 "
 
+if [ "$BACKUP_MODE" = "hot-incremental" ]; then
+  STREAM_START_FILE="$(read_binlog_status "$SRC" | awk '{print $1}')"
+  if [ -z "$STREAM_START_FILE" ]; then
+    echo "missing binlog stream start file" >&2
+    exit 1
+  fi
+  start_binlog_stream "$STREAM_START_FILE"
+  wait_for_binlog_file "$STREAM_START_FILE"
+fi
+
 log "Running $BACKUP_MODE physical full backup"
 if [ "$BACKUP_MODE" = "coldcopy" ]; then
   read_binlog_status "$SRC" > "$BASE/meta/xtrabackup_binlog_info"
@@ -215,6 +267,16 @@ elif [ "$BACKUP_MODE" = "stream" ]; then
     echo "full.xbstream is empty" >&2
     exit 1
   fi
+elif [ "$BACKUP_MODE" = "hot-incremental" ]; then
+  if ! run_tool --network "$NET" \
+    -v "$BASE:/work" \
+    --volumes-from "$SRC" \
+    --entrypoint bash "$XTRABACKUP_IMAGE" -lc \
+    "xtrabackup --backup --host=$SRC_CONNECT_HOST --port=3306 --user=root --password='$ROOT_PASSWORD' --datadir=/var/lib/mysql --target-dir=/work/full --extra-lsndir=/work/full-meta" \
+    > "$BASE/xtrabackup-full.out" 2> "$BASE/xtrabackup-full.log"; then
+    cat "$BASE/xtrabackup-full.log" >&2 || true
+    exit 1
+  fi
 else
   if ! run_tool --network "$NET" \
     -v "$BASE:/work" \
@@ -227,10 +289,32 @@ else
   fi
 fi
 
+BACKUP_BINLOG_INFO="$BASE/meta/xtrabackup_binlog_info"
+if [ "$BACKUP_MODE" = "hot-incremental" ]; then
+  log "Reading full backup binlog coordinate"
+  cat "$BASE/full/xtrabackup_binlog_info"
+
+  log "Writing row before incremental backup"
+  sleep 2
+  mysql_exec "$SRC" "INSERT INTO $DB_NAME.events(id, phase, note) VALUES (2, 'after_full_before_incremental', 'must_exist'); FLUSH LOGS;"
+
+  log "Running hot incremental physical backup"
+  if ! run_tool --network "$NET" \
+    -v "$BASE:/work" \
+    --volumes-from "$SRC" \
+    --entrypoint bash "$XTRABACKUP_IMAGE" -lc \
+    "xtrabackup --backup --host=$SRC_CONNECT_HOST --port=3306 --user=root --password='$ROOT_PASSWORD' --datadir=/var/lib/mysql --target-dir=/work/inc1 --incremental-basedir=/work/full --extra-lsndir=/work/inc1-meta" \
+    > "$BASE/xtrabackup-inc1.out" 2> "$BASE/xtrabackup-inc1.log"; then
+    cat "$BASE/xtrabackup-inc1.log" >&2 || true
+    exit 1
+  fi
+  BACKUP_BINLOG_INFO="$BASE/inc1/xtrabackup_binlog_info"
+fi
+
 log "Reading backup binlog coordinate"
-cat "$BASE/meta/xtrabackup_binlog_info"
-BINLOG_FILE="$(awk '{print $1}' "$BASE/meta/xtrabackup_binlog_info")"
-BINLOG_POS="$(awk '{print $2}' "$BASE/meta/xtrabackup_binlog_info")"
+cat "$BACKUP_BINLOG_INFO"
+BINLOG_FILE="$(awk '{print $1}' "$BACKUP_BINLOG_INFO")"
+BINLOG_POS="$(awk '{print $2}' "$BACKUP_BINLOG_INFO")"
 if [ -z "$BINLOG_FILE" ] || [ -z "$BINLOG_POS" ]; then
   echo "missing binlog coordinate" >&2
   exit 1
@@ -238,22 +322,37 @@ fi
 
 log "Writing rows around PITR target"
 sleep 2
-mysql_exec "$SRC" "INSERT INTO $DB_NAME.events(id, phase, note) VALUES (2, 'before_target', 'must_exist');"
+if [ "$BACKUP_MODE" = "hot-incremental" ]; then
+  mysql_exec "$SRC" "INSERT INTO $DB_NAME.events(id, phase, note) VALUES (3, 'before_target', 'must_exist');"
+else
+  mysql_exec "$SRC" "INSERT INTO $DB_NAME.events(id, phase, note) VALUES (2, 'before_target', 'must_exist');"
+fi
 sleep 2
 TARGET_TIME="$(date -u '+%Y-%m-%d %H:%M:%S')"
 log "PITR target time: $TARGET_TIME"
 sleep 2
-mysql_exec "$SRC" "INSERT INTO $DB_NAME.events(id, phase, note) VALUES (3, 'after_target', 'must_not_exist'); FLUSH LOGS;"
+if [ "$BACKUP_MODE" = "hot-incremental" ]; then
+  mysql_exec "$SRC" "INSERT INTO $DB_NAME.events(id, phase, note) VALUES (4, 'after_target', 'must_not_exist'); FLUSH LOGS;"
+else
+  mysql_exec "$SRC" "INSERT INTO $DB_NAME.events(id, phase, note) VALUES (3, 'after_target', 'must_not_exist'); FLUSH LOGS;"
+fi
 
-log "Capturing remote binlogs from $BINLOG_FILE"
 SRC_CONNECT_HOST="$(container_ip "$SRC")"
-if ! run_tool --network "$NET" \
-  -v "$BASE/binlogs:/work/binlogs" \
-  --entrypoint bash "$TOOL_IMAGE" -lc \
-  "mysqlbinlog --read-from-remote-server --raw --to-last-log --host=$SRC_CONNECT_HOST --port=3306 --user=root --password='$ROOT_PASSWORD' --result-file=/work/binlogs/ $BINLOG_FILE" \
-  > "$BASE/mysqlbinlog-raw.out" 2> "$BASE/mysqlbinlog-raw.log"; then
-  cat "$BASE/mysqlbinlog-raw.log" >&2 || true
-  exit 1
+if [ "$BACKUP_MODE" = "hot-incremental" ]; then
+  log "Waiting for realtime binlogs from $BINLOG_FILE"
+  wait_for_binlog_file "$BINLOG_FILE"
+  sleep 3
+  stop_binlog_stream
+else
+  log "Capturing remote binlogs from $BINLOG_FILE"
+  if ! run_tool --network "$NET" \
+    -v "$BASE/binlogs:/work/binlogs" \
+    --entrypoint bash "$TOOL_IMAGE" -lc \
+    "mysqlbinlog --read-from-remote-server --raw --to-last-log --host=$SRC_CONNECT_HOST --port=3306 --user=root --password='$ROOT_PASSWORD' --result-file=/work/binlogs/ $BINLOG_FILE" \
+    > "$BASE/mysqlbinlog-raw.out" 2> "$BASE/mysqlbinlog-raw.log"; then
+    cat "$BASE/mysqlbinlog-raw.log" >&2 || true
+    exit 1
+  fi
 fi
 ls -l "$BASE/binlogs"
 
@@ -267,7 +366,23 @@ if [ "$BACKUP_MODE" = "stream" ]; then
     > "$BASE/xbstream-extract.out" 2> "$BASE/xbstream-extract.log"
 fi
 
-if [ "$BACKUP_MODE" != "coldcopy" ]; then
+if [ "$BACKUP_MODE" = "hot-incremental" ]; then
+  log "Preparing full backup with apply-log-only"
+  if ! run_tool -v "$BASE:/work" --entrypoint bash "$XTRABACKUP_IMAGE" -lc \
+    "xtrabackup --prepare --apply-log-only --target-dir=/work/full" \
+    > "$BASE/xtrabackup-prepare-full.out" 2> "$BASE/xtrabackup-prepare-full.log"; then
+    cat "$BASE/xtrabackup-prepare-full.log" >&2 || true
+    exit 1
+  fi
+
+  log "Applying incremental backup"
+  if ! run_tool -v "$BASE:/work" --entrypoint bash "$XTRABACKUP_IMAGE" -lc \
+    "xtrabackup --prepare --target-dir=/work/full --incremental-dir=/work/inc1" \
+    > "$BASE/xtrabackup-prepare-inc1.out" 2> "$BASE/xtrabackup-prepare-inc1.log"; then
+    cat "$BASE/xtrabackup-prepare-inc1.log" >&2 || true
+    exit 1
+  fi
+elif [ "$BACKUP_MODE" != "coldcopy" ]; then
   log "Preparing backup"
   if ! run_tool -v "$BASE:/work" --entrypoint bash "$XTRABACKUP_IMAGE" -lc \
     "xtrabackup --prepare --target-dir=/work/restore-extract" \
@@ -280,7 +395,11 @@ else
 fi
 
 log "Copying prepared datadir"
-cp -a "$BASE/restore-extract/." "$BASE/restore-data/"
+if [ "$BACKUP_MODE" = "hot-incremental" ]; then
+  cp -a "$BASE/full/." "$BASE/restore-data/"
+else
+  cp -a "$BASE/restore-extract/." "$BASE/restore-data/"
+fi
 chown -R 999:999 "$BASE/restore-data"
 
 log "Starting restored MySQL $VERSION"
@@ -298,8 +417,13 @@ wait_mysql_tcp "$DST_CONNECT_HOST" "$DST"
 log "Rows after full restore before PITR"
 mysql_exec "$DST" "SELECT id, phase FROM $DB_NAME.events ORDER BY id;"
 FULL_ROWS="$(mysql_exec "$DST" "SELECT GROUP_CONCAT(CONCAT(id, ':', phase) ORDER BY id SEPARATOR ',') FROM $DB_NAME.events;")"
-if [ "$FULL_ROWS" != "1:before_full" ]; then
+EXPECTED_FULL_ROWS="1:before_full"
+if [ "$BACKUP_MODE" = "hot-incremental" ]; then
+  EXPECTED_FULL_ROWS="1:before_full,2:after_full_before_incremental"
+fi
+if [ "$FULL_ROWS" != "$EXPECTED_FULL_ROWS" ]; then
   echo "unexpected full restore rows: $FULL_ROWS" >&2
+  echo "expected: $EXPECTED_FULL_ROWS" >&2
   exit 1
 fi
 
@@ -336,11 +460,15 @@ fi
 log "Rows after PITR"
 mysql_exec "$DST" "SELECT id, phase FROM $DB_NAME.events ORDER BY id;"
 PITR_ROWS="$(mysql_exec "$DST" "SELECT GROUP_CONCAT(CONCAT(id, ':', phase) ORDER BY id SEPARATOR ',') FROM $DB_NAME.events;")"
-if [ "$PITR_ROWS" != "1:before_full,2:before_target" ]; then
+EXPECTED_PITR_ROWS="1:before_full,2:before_target"
+if [ "$BACKUP_MODE" = "hot-incremental" ]; then
+  EXPECTED_PITR_ROWS="1:before_full,2:after_full_before_incremental,3:before_target"
+fi
+if [ "$PITR_ROWS" != "$EXPECTED_PITR_ROWS" ]; then
   echo "unexpected PITR rows: $PITR_ROWS" >&2
-  echo "expected: 1:before_full,2:before_target" >&2
+  echo "expected: $EXPECTED_PITR_ROWS" >&2
   cat "$BASE/mysqlbinlog-apply.log" >&2 || true
   exit 1
 fi
 
-log "PASS mysql $VERSION physical backup + PITR verified"
+log "PASS mysql $VERSION $BACKUP_MODE physical backup + PITR verified"
