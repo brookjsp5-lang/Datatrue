@@ -1,0 +1,228 @@
+package users_services
+
+import (
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/google/uuid"
+	"golang.org/x/crypto/bcrypt"
+
+	user_dto "databasus-backend/internal/features/users/dto"
+	user_enums "databasus-backend/internal/features/users/enums"
+	user_interfaces "databasus-backend/internal/features/users/interfaces"
+	user_models "databasus-backend/internal/features/users/models"
+	user_repositories "databasus-backend/internal/features/users/repositories"
+)
+
+type UserManagementService struct {
+	userRepository *user_repositories.UserRepository
+	auditLogWriter user_interfaces.AuditLogWriter
+}
+
+func (s *UserManagementService) SetAuditLogWriter(writer user_interfaces.AuditLogWriter) {
+	s.auditLogWriter = writer
+}
+
+func (s *UserManagementService) GetUsers(
+	currentUser *user_models.User,
+	limit, offset int,
+	beforeCreatedAt *time.Time,
+	query string,
+) ([]*user_models.User, int64, error) {
+	if !currentUser.CanManageUsers() {
+		return nil, 0, errors.New("insufficient permissions to list users")
+	}
+
+	return s.userRepository.GetUsers(limit, offset, beforeCreatedAt, query)
+}
+
+func (s *UserManagementService) CreateUser(
+	request *user_dto.CreateUserRequestDTO,
+	createdBy *user_models.User,
+) (*user_models.User, error) {
+	if !createdBy.CanManageUsers() {
+		return nil, errors.New("insufficient permissions to create users")
+	}
+
+	if !request.Role.IsValid() {
+		return nil, errors.New("invalid user role")
+	}
+
+	if request.Role == user_enums.UserRoleAdmin && createdBy.Email != "admin" {
+		return nil, errors.New("only the root admin user can create admin accounts")
+	}
+
+	existingUser, err := s.userRepository.GetUserByEmail(request.Email)
+	if err != nil {
+		return nil, fmt.Errorf("failed to check existing user: %w", err)
+	}
+
+	if existingUser != nil {
+		return nil, errors.New("user with this email already exists")
+	}
+
+	hashedPassword, err := bcrypt.GenerateFromPassword(
+		[]byte(request.Password),
+		bcrypt.DefaultCost,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to hash password: %w", err)
+	}
+
+	hashedPasswordStr := string(hashedPassword)
+	user := &user_models.User{
+		ID:                   uuid.New(),
+		Email:                request.Email,
+		Name:                 request.Name,
+		HashedPassword:       &hashedPasswordStr,
+		PasswordCreationTime: time.Now().UTC(),
+		Role:                 request.Role,
+		Status:               user_enums.UserStatusActive,
+		CreatedAt:            time.Now().UTC(),
+	}
+
+	if err := s.userRepository.CreateUser(user); err != nil {
+		return nil, fmt.Errorf("failed to create user: %w", err)
+	}
+
+	if s.auditLogWriter != nil {
+		s.auditLogWriter.WriteAuditLog(
+			fmt.Sprintf("User created by admin: %s", user.Email),
+			&createdBy.ID,
+			nil,
+		)
+	}
+
+	return user, nil
+}
+
+func (s *UserManagementService) GetUserProfile(
+	userID uuid.UUID,
+	requestedBy *user_models.User,
+) (*user_models.User, error) {
+	// Users can view their own profile, admins can view any profile
+	if userID != requestedBy.ID && !requestedBy.CanManageUsers() {
+		return nil, errors.New("insufficient permissions to view user profile")
+	}
+
+	return s.userRepository.GetUserByID(userID)
+}
+
+func (s *UserManagementService) DeactivateUser(
+	userID uuid.UUID,
+	deactivatedBy *user_models.User,
+) error {
+	if !deactivatedBy.CanManageUsers() {
+		return errors.New("insufficient permissions to deactivate users")
+	}
+
+	// Don't allow deactivating self
+	if userID == deactivatedBy.ID {
+		return errors.New("cannot deactivate your own account")
+	}
+
+	user, err := s.userRepository.GetUserByID(userID)
+	if err != nil {
+		return fmt.Errorf("failed to get user: %w", err)
+	}
+
+	// Only user with email "admin" can deactivate ADMIN users
+	if user.Role == user_enums.UserRoleAdmin && deactivatedBy.Email != "admin" {
+		return errors.New("only the root admin user can deactivate admin accounts")
+	}
+
+	if err := s.userRepository.UpdateUserStatus(userID, user_enums.UserStatusInactive); err != nil {
+		return fmt.Errorf("failed to deactivate user: %w", err)
+	}
+
+	if s.auditLogWriter != nil {
+		s.auditLogWriter.WriteAuditLog(
+			fmt.Sprintf("User deactivated: %s", user.Email),
+			&deactivatedBy.ID,
+			nil,
+		)
+	}
+
+	return nil
+}
+
+func (s *UserManagementService) ActivateUser(
+	userID uuid.UUID,
+	activatedBy *user_models.User,
+) error {
+	if !activatedBy.CanManageUsers() {
+		return errors.New("insufficient permissions to activate users")
+	}
+
+	user, err := s.userRepository.GetUserByID(userID)
+	if err != nil {
+		return fmt.Errorf("failed to get user: %w", err)
+	}
+
+	// Only user with email "admin" can activate ADMIN users
+	if user.Role == user_enums.UserRoleAdmin && activatedBy.Email != "admin" {
+		return errors.New("only the root admin user can activate admin accounts")
+	}
+
+	if err := s.userRepository.UpdateUserStatus(userID, user_enums.UserStatusActive); err != nil {
+		return fmt.Errorf("failed to activate user: %w", err)
+	}
+
+	if s.auditLogWriter != nil {
+		s.auditLogWriter.WriteAuditLog(
+			fmt.Sprintf("User activated: %s", user.Email),
+			&activatedBy.ID,
+			nil,
+		)
+	}
+
+	return nil
+}
+
+func (s *UserManagementService) ChangeUserRole(
+	userID uuid.UUID,
+	newRole user_enums.UserRole,
+	changedBy *user_models.User,
+) error {
+	if !changedBy.CanManageUsers() {
+		return errors.New("insufficient permissions to change user roles")
+	}
+
+	// Validate role
+	if !newRole.IsValid() {
+		return errors.New("invalid user role")
+	}
+
+	// Don't allow changing own role
+	if userID == changedBy.ID {
+		return errors.New("cannot change your own role")
+	}
+
+	user, err := s.userRepository.GetUserByID(userID)
+	if err != nil {
+		return fmt.Errorf("failed to get user: %w", err)
+	}
+
+	// Only user with email "admin" can promote users to ADMIN or demote ADMIN users
+	if (newRole == user_enums.UserRoleAdmin || user.Role == user_enums.UserRoleAdmin) &&
+		changedBy.Email != "admin" {
+		return errors.New(
+			"only the root admin user can promote users to admin or demote admin users",
+		)
+	}
+
+	if err := s.userRepository.UpdateUserRole(userID, newRole); err != nil {
+		return fmt.Errorf("failed to update user role: %w", err)
+	}
+
+	if s.auditLogWriter != nil {
+		s.auditLogWriter.WriteAuditLog(
+			fmt.Sprintf("User role changed: %s from %s to %s", user.Email, user.Role, newRole),
+			&changedBy.ID,
+			nil,
+		)
+	}
+
+	return nil
+}
